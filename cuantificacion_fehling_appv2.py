@@ -1,121 +1,171 @@
-
 import streamlit as st
-import numpy as np
 import pandas as pd
+import numpy as np
 import cv2
-from io import BytesIO
 from PIL import Image
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.svm import SVR
+from sklearn.metrics import r2_score
+import io
+from collections import defaultdict
 
-st.set_page_config(page_title="Cuantificación Fehling", layout="centered")
-st.title("📷 Cuantificación de Azúcares por Colorimetría (Prueba de Fehling)")
+# Función para suavizar imagen
+def suavizar_imagen(img):
+    return cv2.GaussianBlur(img, (5, 5), 0)
 
-st.markdown("""
-Este prototipo permite:
-1. Subir imágenes de estándares y muestras.
-2. Calcular la curva de calibración a partir del canal rojo (R).
-3. Estimar la concentración de azúcares en muestras.
-""")
-
-# --- Cargar imágenes de estándares ---
-st.header("1️⃣ Subir imágenes de estándares")
-estandar_files = st.file_uploader("Sube imágenes de estándares (nombre: estandar_#.jpg)", accept_multiple_files=True, type=['jpg', 'png'])
-
-# --- Leer las concentraciones desde los nombres de archivo ---
-def extraer_concentracion(nombre):
-    try:
-        return float(nombre.split("_")[1].split(".")[0])
-    except:
-        return None
-
-
-# --- Función para suavizado y normalización ---
-def preprocesar_imagen(imagen_pil):
-    # Convertir PIL a formato OpenCV (BGR)
-    imagen_cv = cv2.cvtColor(np.array(imagen_pil), cv2.COLOR_RGB2BGR)
-
-    # Suavizado con filtro Gaussiano
-    imagen_suavizada = cv2.GaussianBlur(imagen_cv, (5, 5), 0)
-
-    # Convertir a espacio de color LAB para normalizar luminosidad
-    lab = cv2.cvtColor(imagen_suavizada, cv2.COLOR_BGR2LAB)
+# Función para normalizar color
+def normalizar_color(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    l_eq = cv2.equalizeHist(l)
-    lab_eq = cv2.merge((l_eq, a, b))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl,a,b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
-    # Convertir de regreso a RGB
-    imagen_normalizada = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
-    return imagen_normalizada
+# Función para seleccionar área manualmente (en Streamlit, mediante sliders)
+def seleccionar_area_con_sliders(img):
+    h, w, _ = img.shape
+    st.write("### Selecciona el área de análisis dentro de la imagen")
+    x_start = st.slider("X inicio", 0, w-1, 0)
+    x_end = st.slider("X fin", x_start+1, w, w)
+    y_start = st.slider("Y inicio", 0, h-1, 0)
+    y_end = st.slider("Y fin", y_start+1, h, h)
+    
+    # Dibuja un rectángulo en la imagen para mostrar el área seleccionada
+    img_con_rectangulo = img.copy()
+    cv2.rectangle(img_con_rectangulo, (x_start, y_start), (x_end, y_end), (0, 255, 0), 2)  # Rectángulo verde
+    st.image(img_con_rectangulo, caption="Área de análisis seleccionada", use_column_width=True)
+    
+    # Calcular el área de fondo (5 píxeles alrededor de la región seleccionada)
+    margen = 5
+    fondo = img[max(y_start - margen, 0):min(y_end + margen, h), max(x_start - margen, 0):min(x_end + margen, w)]
+    
+    # Promediar el color del fondo
+    color_fondo = np.mean(fondo, axis=(0, 1))
+    
+    # Extraer el área de análisis (sin el fondo)
+    area_roi = img[y_start:y_end, x_start:x_end]
+    
+    return area_roi, color_fondo
 
-# --- Procesar imagen y extraer canal rojo promedio ---
-def obtener_rojo_promedio(imagen):
-    img = Image.open(imagen)
-    img = img.convert('RGB')
-    img_np = np.array(img)
-    alto, ancho, _ = img_np.shape
-    roi = img_np[alto//3:2*alto//3, ancho//3:2*ancho//3]  # región central
-    r_prom = np.mean(roi[:, :, 0])
-    return r_prom
+# Función para extraer color promedio de una imagen
+def extraer_color_promedio(imagen):
+    promedio_bgr = np.mean(imagen, axis=(0, 1))
+    return promedio_bgr[::-1]  # Convertir BGR a RGB
 
-# --- Procesar estándares ---
-col1, col2 = st.columns(2)
-col1.subheader("Imágenes cargadas")
-col2.subheader("Valores extraídos")
+# Página principal
+st.title("Cuantificación de azúcares con prueba de Fehling")
 
-datos = []
+st.header("1. Subir imágenes estándar")
+imagenes_estandar = st.file_uploader("Carga imágenes de estándares con concentraciones conocidas", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
+concentraciones = []
+colores_estandar = []
 
-for archivo in estandar_files:
-    conc = extraer_concentracion(archivo.name)
-    rojo = obtener_rojo_promedio(archivo)
-    col1.image(archivo, width=150, caption=archivo.name)
-    col2.write(f"Rojo promedio: {rojo:.2f} | Conc: {conc} g/L")
-    datos.append((rojo, conc))
+# Usar un diccionario para agrupar muestras del mismo estándar (concentración)
+estandares_grupales = defaultdict(list)
 
-# --- Crear modelo de calibración ---
-if len(datos) >= 2:
-    X = np.array([x[0] for x in datos]).reshape(-1, 1)
-    y = np.array([x[1] for x in datos])
-    modelo = LinearRegression().fit(X, y)
-    st.success("Curva de calibración generada ✅")
+if imagenes_estandar:
+    for i, img_file in enumerate(imagenes_estandar):
+        st.image(img_file, caption=f"Estándar {i+1}", width=300)
+        conc = st.number_input(f"Concentración para Estándar {i+1} (mg/mL):", min_value=0.0, step=0.1, key=f"conc_{i}")
+        imagen = Image.open(img_file)
+        imagen_cv = cv2.cvtColor(np.array(imagen), cv2.COLOR_RGB2BGR)
+        imagen_suave = suavizar_imagen(imagen_cv)
+        imagen_norm = normalizar_color(imagen_suave)
+        
+        # Seleccionar área y obtener color promedio del fondo
+        area_roi, color_fondo = seleccionar_area_con_sliders(imagen_norm)
+        
+        # Sustracción del fondo
+        color_ajustado = extraer_color_promedio(area_roi) - color_fondo
+        
+        # Agrupar por concentración (promediar los valores de color para la misma concentración)
+        estandares_grupales[conc].append(color_ajustado)
 
-    # --- Mostrar la curva ---
+# Promediar las muestras de un mismo estándar
+for conc in estandares_grupales:
+    colores_estandar.append(np.mean(estandares_grupales[conc], axis=0))  # Promediar las características del color
+    concentraciones.append(conc)
+
+# Selección del modelo de regresión
+modelo_seleccionado = st.selectbox("Selecciona el modelo de regresión", ["Regresión Lineal", "Regresión Polinómica", "Regresión SVR"])
+
+# Crear modelo de calibración
+modelo = None
+r2_general = None
+if concentraciones and colores_estandar:
+    X = np.array(colores_estandar)
+    y = np.array(concentraciones)
+
+    # Modelo de regresión lineal
+    if modelo_seleccionado == "Regresión Lineal":
+        modelo = LinearRegression().fit(X, y)
+        predicciones = modelo.predict(X)
+        r2_general = r2_score(y, predicciones)
+    
+    # Modelo de regresión polinómica
+    elif modelo_seleccionado == "Regresión Polinómica":
+        poly = PolynomialFeatures(degree=2)  # Grado 2 como ejemplo
+        X_poly = poly.fit_transform(X)
+        modelo = LinearRegression().fit(X_poly, y)
+        predicciones = modelo.predict(X_poly)
+        r2_general = r2_score(y, predicciones)
+    
+    # Modelo de regresión de soporte vectorial
+    elif modelo_seleccionado == "Regresión SVR":
+        modelo = SVR(kernel='rbf', C=100, gamma=0.1, epsilon=0.1)
+        modelo.fit(X, y)
+        predicciones = modelo.predict(X)
+        r2_general = r2_score(y, predicciones)
+
+    # Mostrar el coeficiente de determinación (R²) general
+    st.subheader(f"Coeficiente de determinación (R²) para la curva de calibración ({modelo_seleccionado}): {r2_general:.4f}")
+
+    st.subheader("Curva de calibración")
     fig, ax = plt.subplots()
-    ax.scatter(X, y, color='red', label='Estándares')
-    x_range = np.linspace(X.min(), X.max(), 100).reshape(-1, 1)
-    ax.plot(x_range, modelo.predict(x_range), label='Modelo lineal')
-    ax.set_xlabel("Intensidad de canal Rojo (R)")
-    ax.set_ylabel("Concentración (g/L)")
-    ax.set_title("Curva de calibración Fehling")
+    ax.scatter(concentraciones, predicciones, label="Datos calibrados")
+    ax.plot([min(concentraciones), max(concentraciones)], [min(concentraciones), max(concentraciones)], 'r--', label="Ideal")
+    ax.set_xlabel("Concentración real (mg/mL)")
+    ax.set_ylabel("Concentración estimada (mg/mL)")
     ax.legend()
     st.pyplot(fig)
 
-    # --- Subir imágenes de muestra ---
-    st.header("2️⃣ Subir imágenes de muestra")
-    muestra_files = st.file_uploader("Sube imágenes de muestras", accept_multiple_files=True, type=['jpg', 'png'], key="muestras")
+st.header("2. Subir imágenes de muestra")
+imagenes_muestra = st.file_uploader("Carga imágenes de muestras a analizar", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
+resultados = []
 
-    resultados = []
-    if muestra_files:
-        for archivo in muestra_files:
-            rojo = obtener_rojo_promedio(archivo)
-            pred = modelo.predict([[rojo]])[0]
-            st.image(archivo, width=150, caption=f"Conc estimada: {pred:.2f} g/L")
-            resultados.append({"Archivo": archivo.name, "Rojo": rojo, "Concentración estimada (g/L)": pred})
+if imagenes_muestra and modelo:
+    for i, img_file in enumerate(imagenes_muestra):
+        st.image(img_file, caption=f"Muestra {i+1}", width=300)
+        imagen = Image.open(img_file)
+        imagen_cv = cv2.cvtColor(np.array(imagen), cv2.COLOR_RGB2BGR)
+        imagen_suave = suavizar_imagen(imagen_cv)
+        imagen_norm = normalizar_color(imagen_suave)
+        
+        # Seleccionar área y obtener color promedio del fondo
+        area_roi, color_fondo = seleccionar_area_con_sliders(imagen_norm)
+        
+        # Sustracción del fondo
+        color_ajustado = extraer_color_promedio(area_roi) - color_fondo
+        
+        # Predicción de concentración
+        if modelo_seleccionado == "Regresión Polinómica":
+            X_poly = PolynomialFeatures(degree=2).fit_transform([color_ajustado])
+            pred = modelo.predict(X_poly)[0]
+        else:
+            pred = modelo.predict([color_ajustado])[0]
+        
+        # Calcular R² para cada muestra (como un "coeficiente de estimación")
+        r2_muestra = r2_score([concentraciones[0]], [pred])  # Usamos un valor conocido como base para R² de muestra
+        
+        resultados.append({"Muestra": f"Muestra {i+1}", "Concentración estimada (mg/mL)": round(pred, 2), "R² de estimación": round(r2_muestra, 4)})
 
-        df_resultados = pd.DataFrame(resultados)
+    df_resultados = pd.DataFrame(resultados)
+    st.subheader("Resultados de concentración estimada")
+    st.dataframe(df_resultados)
 
-        # Mostrar tabla y opción de descarga
-        st.dataframe(df_resultados)
-
-        buffer = BytesIO()
-        df_resultados.to_csv(buffer, index=False)
-        buffer.seek(0)
-
-        st.download_button(
-            label="⬇️ Descargar resultados como CSV",
-            data=buffer,
-            file_name="resultados_fehling.csv",
-            mime="text/csv"
-        )
-else:
-    st.info("Por favor, sube al menos dos imágenes de estándares para generar la curva.")
+    # Botón para descargar resultados
+    csv = df_resultados.to_csv(index=False)
+    st.download_button(label="Descargar resultados en CSV", data=csv, file_name='resultados_fehling.csv', mime='text/csv')
